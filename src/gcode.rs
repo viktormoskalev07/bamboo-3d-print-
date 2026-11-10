@@ -256,6 +256,24 @@ pub fn estimate(strokes: &[Stroke], cfg: &Config) -> Stats {
     g.st
 }
 
+/// Блок настроек профиля (как в файлах Bambu Studio) — прошивка/Connect ожидают его в G-code.
+const CONFIG_BLOCK: &str = include_str!("../templates/a1/config_block.gcode");
+
+/// Приводим G-code к разметке Bambu Studio: HEADER -> CONFIG -> EXECUTABLE.
+fn bambu_layout(code: String) -> String {
+    let marker = "; HEADER_BLOCK_END\n";
+    let Some(i) = code.find(marker) else { return code };
+    let (head, body) = code.split_at(i + marker.len());
+    let mut out = String::with_capacity(code.len() + CONFIG_BLOCK.len() + 128);
+    out.push_str(head);
+    out.push('\n');
+    out.push_str(CONFIG_BLOCK.trim_end());
+    out.push_str("\n\n; EXECUTABLE_BLOCK_START\n");
+    out.push_str(body);
+    out.push_str("M18 X Y Z\n; EXECUTABLE_BLOCK_END\n");
+    out
+}
+
 pub fn build(strokes: &[Stroke], cfg: &Config, title: &str) -> (String, Stats) {
     let mk = |emit, total| Gen {
         cfg,
@@ -273,5 +291,5 @@ pub fn build(strokes: &[Stroke], cfg: &Config, title: &str) -> (String, Stats) {
     let total = dry.t;
     let mut g = mk(true, total);
     g.run(strokes, title);
-    (g.out, g.st)
+    (bambu_layout(g.out), g.st)
 }

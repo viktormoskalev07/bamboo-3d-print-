@@ -753,7 +753,8 @@ impl App {
         let dir = std::env::temp_dir().join("bambu-plotter");
         let _ = std::fs::create_dir_all(&dir);
         let title = self.job_title();
-        let path = dir.join(format!("{}.gcode.3mf", safe_file_name(&title)));
+        let ascii = translit(&title);
+        let path = dir.join(format!("{ascii}.gcode.3mf"));
         if let Err(e) = self.export_to(&path) {
             self.notify(ctx, format!("{e:#}"), true);
             return;
@@ -779,7 +780,7 @@ impl App {
             self.job_rx = Some(rx);
             self.notify(ctx, "Отправка на принтер по сети…", false);
         } else {
-            match connect::open(&path, &title) {
+            match connect::open(&path, &ascii) {
                 Ok(()) => self.notify(ctx, "Открыто в Bambu Connect — выберите принтер и нажмите «Печать»", false),
                 Err(e) => self.notify(ctx, format!("{e:#}"), true),
             }
@@ -2807,6 +2808,43 @@ fn normalize(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
 
 fn file_name(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Транслитерация в латиницу для имени файла на принтере: «Мой рисунок — стр. 2» -> «Moy_risunok_str_2».
+fn translit(s: &str) -> String {
+    let map = |c: char| -> &'static str {
+        match c.to_lowercase().next().unwrap_or(c) {
+            'а' => "a", 'б' => "b", 'в' => "v", 'г' => "g", 'д' => "d", 'е' => "e", 'ё' => "e", 'ж' => "zh",
+            'з' => "z", 'и' => "i", 'й' => "y", 'к' => "k", 'л' => "l", 'м' => "m", 'н' => "n", 'о' => "o",
+            'п' => "p", 'р' => "r", 'с' => "s", 'т' => "t", 'у' => "u", 'ф' => "f", 'х' => "h", 'ц' => "ts",
+            'ч' => "ch", 'ш' => "sh", 'щ' => "sch", 'ъ' => "", 'ы' => "y", 'ь' => "", 'э' => "e", 'ю' => "yu",
+            'я' => "ya",
+            _ => "",
+        }
+    };
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            let t = map(c);
+            if !t.is_empty() {
+                if c.is_uppercase() {
+                    let mut it = t.chars();
+                    if let Some(f) = it.next() {
+                        out.extend(f.to_uppercase());
+                        out.push_str(it.as_str());
+                    }
+                } else {
+                    out.push_str(t);
+                }
+            } else if !out.ends_with('_') && !out.is_empty() {
+                out.push('_');
+            }
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() { "plot".into() } else { out.chars().take(60).collect() }
 }
 
 fn safe_file_name(s: &str) -> String {
