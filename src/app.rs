@@ -1268,6 +1268,7 @@ impl App {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
                 self.img_tex = Some(ui.ctx().load_texture("img_thumb", img, egui::TextureOptions::LINEAR));
             }
+            self.image_edit_card(ui);
             let p = &mut self.doc.img;
             let tex = self.img_tex.clone();
             card(ui, "ФОТО → ЛИНИИ", |ui| {
@@ -1295,7 +1296,10 @@ impl App {
                 tcb(ui, &mut p.invert, "Инвертировать (светлое ↔ тёмное)");
                 ui.label(RichText::new("Меньше шаг — больше деталей, но дольше печать. Ручка обычно 0.4–0.7 мм.").color(DIM).small());
             });
-            self.image_edit_card(ui);
+        } else if matches!(self.svg, Some(jobs::ImageSrc::Vector(_))) {
+            card(ui, "ПРАВКА КАРТИНКИ", |ui| {
+                ui.label(RichText::new("Ластик, обрезка и удаление фона работают для фото и картинок (JPG, PNG, BMP, GIF, WebP). SVG рисуется как есть.").color(DIM));
+            });
         }
         card(ui, "РАЗМЕЩЕНИЕ", |ui| {
             tcb(ui, &mut self.doc.svg_fit, "Растянуть на весь лист");
@@ -2189,6 +2193,38 @@ impl App {
                 };
                 painter.text(paper.center(), Align2::CENTER_CENTER, msg, FontId::proportional(16.0), Color32::from_rgb(160, 165, 175));
             }
+            // плавающая панель инструментов картинки (видно сразу, без прокрутки)
+            if image_mode && is_raster {
+                egui::Area::new(egui::Id::new("img_tools"))
+                    .fixed_pos(rect.left_top() + Vec2::new(12.0, 12.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::default()
+                            .fill(Color32::from_rgba_unmultiplied(30, 34, 41, 240))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (t, l, tip) in [
+                                        (0u8, "Двигать", "Двигать картинку; уголок — размер (V)"),
+                                        (1, "Обрезать", "Обвести рамкой нужную часть (C)"),
+                                        (2, "Ластик", "Стирать мышью по картинке (E)"),
+                                    ] {
+                                        let r = segment(ui, self.img_tool == t, l).on_hover_text(tip);
+                                        if r.clicked() {
+                                            self.img_tool = t;
+                                        }
+                                    }
+                                    if self.img_tool == 2 {
+                                        ui.add_space(6.0);
+                                        ui.label(RichText::new("кисть").color(DIM));
+                                        ui.add(egui::DragValue::new(&mut self.erase_mm).range(0.5..=40.0).speed(0.2).fixed_decimals(1).suffix(" мм"));
+                                    }
+                                });
+                            });
+                    });
+            }
+
             // подложка: сама картинка под линиями (во вкладке «Рисунок»)
             if let (true, Some(ir), Some(tex)) = (image_mode, img_rect, self.img_tex.as_ref()) {
                 if is_raster {
