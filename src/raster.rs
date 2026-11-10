@@ -41,6 +41,13 @@ impl Default for Params {
     }
 }
 
+/// Мазок ластика: точки в координатах картинки (u, v ∈ 0..1), радиус — в долях ширины картинки.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Erase {
+    pub r: f64,
+    pub pts: Vec<(f64, f64)>,
+}
+
 /// Картинка в оттенках серого: 0 — белое (нет линий), 1 — чёрное.
 #[derive(Clone)]
 pub struct Raster {
@@ -65,14 +72,100 @@ pub fn load(path: &Path) -> Result<Raster> {
         let a = a as f32 / 255.0;
         dark.push((1.0 - lum) * a);
     }
-    let t = image::DynamicImage::ImageRgba8(rgba).thumbnail(256, 256).to_rgba8();
+    let t = image::DynamicImage::ImageRgba8(rgba).thumbnail(512, 512).to_rgba8();
     let thumb = (t.width() as usize, t.height() as usize, t.into_raw());
     Ok(Raster { w, h, dark, thumb })
 }
 
 impl Raster {
-    pub fn aspect(&self) -> f64 {
-        self.w as f64 / self.h.max(1) as f64
+    /// Пропорции после обрезки `crop` = [u0, v0, u1, v1].
+    pub fn aspect_cropped(&self, crop: [f64; 4]) -> f64 {
+        let cw = (crop[2] - crop[0]).max(1e-3) * self.w as f64;
+        let ch = (crop[3] - crop[1]).max(1e-3) * self.h as f64;
+        cw / ch
+    }
+
+    /// Ластик и «убрать фон»: возвращает копию, где стёртое — белое (без линий).
+    pub fn masked(&self, erase: &[Erase], bg_tol: Option<f64>) -> Raster {
+        let (w, h) = (self.w, self.h);
+        let mut dark = self.dark.clone();
+        if let Some(tol) = bg_tol {
+            // заливка от краёв: соседние пиксели, похожие на краевой, считаем фоном
+            let mut seen = vec![false; w * h];
+            let mut stack: Vec<(usize, f32)> = Vec::new();
+            for x in 0..w {
+                for y in [0, h - 1] {
+                    let i = y * w + x;
+                    stack.push((i, self.dark[i]));
+                }
+            }
+            for y in 0..h {
+                for x in [0, w - 1] {
+                    let i = y * w + x;
+                    stack.push((i, self.dark[i]));
+                }
+            }
+            let tol = tol as f32;
+            while let Some((i, refv)) = stack.pop() {
+                if seen[i] || (self.dark[i] - refv).abs() > tol {
+                    continue;
+                }
+                seen[i] = true;
+                dark[i] = 0.0;
+                let (x, y) = (i % w, i / w);
+                let v = self.dark[i];
+                if x > 0 { stack.push((i - 1, v)); }
+                if x + 1 < w { stack.push((i + 1, v)); }
+                if y > 0 { stack.push((i - w, v)); }
+                if y + 1 < h { stack.push((i + w, v)); }
+            }
+        }
+        for e in erase {
+            let rp = (e.r * w as f64).max(0.5);
+            let stamp = |dark: &mut Vec<f32>, u: f64, v: f64| {
+                let (cx, cy) = (u * w as f64, v * h as f64);
+                let (x0, x1) = ((cx - rp).floor().max(0.0) as usize, ((cx + rp).ceil() as usize).min(w));
+                let (y0, y1) = ((cy - rp).floor().max(0.0) as usize, ((cy + rp).ceil() as usize).min(h));
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
+                        if dx * dx + dy * dy <= rp * rp {
+                            dark[y * w + x] = 0.0;
+                        }
+                    }
+                }
+            };
+            for (k, &(u, v)) in e.pts.iter().enumerate() {
+                stamp(&mut dark, u, v);
+                if let Some(&(pu, pv)) = e.pts.get(k + 1) {
+                    // промежуточные отпечатки, чтобы мазок был сплошным
+                    let d = ((pu - u) * w as f64).hypot((pv - v) * h as f64);
+                    let n = (d / (rp * 0.5)).ceil() as usize;
+                    for j in 1..n {
+                        let t = j as f64 / n as f64;
+                        stamp(&mut dark, u + (pu - u) * t, v + (pv - v) * t);
+                    }
+                }
+            }
+        }
+        Raster { w, h, dark, thumb: self.thumb.clone() }
+    }
+
+    /// Картинка для показа в интерфейсе (с учётом ластика/фона): RGBA, до `max` px.
+    pub fn preview_rgba(&self, max: usize) -> (usize, usize, Vec<u8>) {
+        let k = (self.w.max(self.h) as f64 / max as f64).max(1.0);
+        let (tw, th) = (((self.w as f64) / k).round().max(1.0) as usize, ((self.h as f64) / k).round().max(1.0) as usize);
+        let mut px = Vec::with_capacity(tw * th * 4);
+        for y in 0..th {
+            for x in 0..tw {
+                let sx = ((x as f64 + 0.5) * k) as usize;
+                let sy = ((y as f64 + 0.5) * k) as usize;
+                let d = self.dark[sy.min(self.h - 1) * self.w + sx.min(self.w - 1)];
+                let g = (255.0 * (1.0 - d)) as u8;
+                px.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        (tw, th, px)
     }
 
     /// Темнота в точке (u, v) ∈ [0,1]² с учётом яркости/контраста/инверсии (билинейно).
@@ -90,19 +183,21 @@ impl Raster {
 }
 
 /// Векторизация в прямоугольник (x, y, w, h) мм (Y вниз). `rot` — поворот на 90°×rot.
-pub fn vectorize(r: &Raster, rect: (f64, f64, f64, f64), rot: u8, p: &Params) -> Paths {
+/// Точка листа -> координаты исходной картинки (u, v) с учётом поворота и обрезки.
+pub fn area_to_uv(x: f64, y: f64, rect: (f64, f64, f64, f64), rot: u8, crop: [f64; 4]) -> (f64, f64) {
     let (rx, ry, rw, rh) = rect;
-    let rot = rot % 4;
-    // точка листа -> координаты картинки (u, v) с учётом поворота
-    let uv = |x: f64, y: f64| -> (f64, f64) {
-        let (a, b) = ((x - rx) / rw, (y - ry) / rh);
-        match rot {
-            1 => (b, 1.0 - a),
-            2 => (1.0 - a, 1.0 - b),
-            3 => (1.0 - b, a),
-            _ => (a, b),
-        }
+    let (a, b) = ((x - rx) / rw, (y - ry) / rh);
+    let (u, v) = match rot % 4 {
+        1 => (b, 1.0 - a),
+        2 => (1.0 - a, 1.0 - b),
+        3 => (1.0 - b, a),
+        _ => (a, b),
     };
+    (crop[0] + u * (crop[2] - crop[0]), crop[1] + v * (crop[3] - crop[1]))
+}
+
+pub fn vectorize(r: &Raster, rect: (f64, f64, f64, f64), rot: u8, crop: [f64; 4], p: &Params) -> Paths {
+    let uv = |x: f64, y: f64| area_to_uv(x, y, rect, rot, crop);
     let dark = |x: f64, y: f64| {
         let (u, v) = uv(x, y);
         r.sample(u, v, p)

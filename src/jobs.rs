@@ -238,6 +238,13 @@ pub struct Doc {
     pub svg_pos: Option<(f64, f64)>,
     /// параметры превращения фото/картинки (JPG, PNG…) в линии
     pub img: crate::raster::Params,
+    /// обрезка картинки [u0, v0, u1, v1] в долях исходного размера
+    pub img_crop: [f64; 4],
+    /// мазки ластика по картинке
+    pub img_erase: Vec<crate::raster::Erase>,
+    /// автоматически убрать однотонный фон (заливка от краёв)
+    pub img_bg: bool,
+    pub img_bg_tol: f64,
 }
 
 /// Источник «Рисунка»: векторный SVG или растровая картинка.
@@ -307,6 +314,10 @@ impl Default for Doc {
             table_pos: None,
             svg_pos: None,
             img: crate::raster::Params::default(),
+            img_crop: [0.0, 0.0, 1.0, 1.0],
+            img_erase: Vec::new(),
+            img_bg: false,
+            img_bg_tol: 0.12,
         }
     }
 }
@@ -321,6 +332,8 @@ pub struct Page {
     pub boxes: Vec<(Elem, [f64; 4])>,
     /// часть рисунка вне зоны ручки — обрезана (печатать можно)
     pub warning: Option<String>,
+    /// прямоугольник картинки на листе [x0, y0, x1, y1] (мм рабочей области) — для ластика/обрезки/размера
+    pub image_rect: Option<[f64; 4]>,
 }
 
 fn shifted(mut p: Paths, (dx, dy): (f64, f64)) -> Paths {
@@ -339,7 +352,7 @@ pub fn build_pages(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>)
         let strokes = calibration(doc, cfg, font);
         return finish_pages(vec![(strokes, Vec::new())], cfg);
     }
-    let layers = layout_layers(doc, cfg, font, svg);
+    let (layers, image_rect) = layout_layers(doc, cfg, font, svg);
     let n = layers.iter().map(|(_, pages, _)| pages.len()).max().unwrap_or(0);
     let mut out = Vec::new();
     for i in 0..n {
@@ -357,16 +370,21 @@ pub fn build_pages(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>)
         }
         out.push((strokes, boxes));
     }
-    finish_pages(out, cfg)
+    let mut pages = finish_pages(out, cfg);
+    if let Some(p) = pages.first_mut() {
+        p.image_rect = image_rect;
+    }
+    pages
 }
 
 /// Раскладка всех элементов в координатах рабочей области. Возвращает (положения, слои по страницам).
-fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -> Vec<(Elem, Vec<Paths>, bool)> {
+fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -> (Vec<(Elem, Vec<Paths>, bool)>, Option<[f64; 4]>) {
     // раскладываем только там, куда дотягивается ручка (важно для A4, который больше стола)
     let u = cfg.usable_area();
     let (size, ls) = (cfg.text.size, cfg.text.line_spacing);
     let gap = 6.0;
     let mut layers: Vec<(Elem, Vec<Paths>, bool)> = Vec::new();
+    let mut image_rect: Option<[f64; 4]> = None;
     let mut bottom: Option<f64> = None; // низ уже размещённого на первой странице
     let clamp_pos = |(x, y): (f64, f64)| (x.max(u[0]), y.max(u[1]));
     let room = |(x, y): (f64, f64)| ((u[2] - x).max(10.0), (u[3] - y).max(10.0));
@@ -404,11 +422,13 @@ fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -
                 let mut pos = doc.svg_pos.unwrap_or(auto);
                 let room_auto = room(auto);
                 let placed = place_image(p.clone(), doc, (room_auto.0 + auto.0, room_auto.1 + auto.1), doc.svg_pos.is_none().then_some(auto), &mut pos);
+                image_rect = geom::bbox(&placed);
                 layers.push((Elem::Image, vec![placed], false));
             }
             ImageSrc::Raster(r) => {
                 // размер: «растянуть» — вписать в свободное место; иначе ширина 100 мм × масштаб
-                let aspect = if doc.svg_rot % 2 == 1 { 1.0 / r.aspect() } else { r.aspect() };
+                let a0 = r.aspect_cropped(doc.img_crop);
+                let aspect = if doc.svg_rot % 2 == 1 { 1.0 / a0 } else { a0 };
                 let pos = doc.svg_pos.unwrap_or(auto);
                 let (rw, rh) = room(if doc.svg_pos.is_some() { clamp_pos(pos) } else { auto });
                 let (mut w, mut h) = if doc.svg_fit {
@@ -422,7 +442,8 @@ fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -
                     w *= k;
                     h *= k;
                 }
-                let lines = crate::raster::vectorize(r, (pos.0, pos.1, w, h), doc.svg_rot, &doc.img);
+                let lines = crate::raster::vectorize(r, (pos.0, pos.1, w, h), doc.svg_rot, doc.img_crop, &doc.img);
+                image_rect = Some([pos.0, pos.1, pos.0 + w, pos.1 + h]);
                 // штриховка и волны уже идут змейкой — порядок не перемешиваем
                 let ordered = doc.img.style != crate::raster::Style::Contour;
                 layers.push((Elem::Image, vec![lines], ordered));
@@ -435,7 +456,7 @@ fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -
         let p: Paths = doc.shapes.iter().flat_map(|s| s.paths(font)).collect();
         layers.push((Elem::Drawing, vec![p], false));
     }
-    layers
+    (layers, image_rect)
 }
 
 fn finish_pages(raw: Vec<(Vec<Stroke>, Vec<(Elem, [f64; 4])>)>, cfg: &Config) -> Vec<Page> {
@@ -460,7 +481,7 @@ fn finish_pages(raw: Vec<(Vec<Stroke>, Vec<(Elem, [f64; 4])>)>, cfg: &Config) ->
             };
             let (code, stats) = gcode::build(&strokes, cfg, "");
             let segs = gcode::simulate(&code, cfg);
-            Page { strokes, stats, error, segs, boxes, warning }
+            Page { strokes, stats, error, segs, boxes, warning, image_rect: None }
         })
         .collect()
 }

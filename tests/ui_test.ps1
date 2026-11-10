@@ -400,6 +400,80 @@ Test "Фото → линии" {
     Call @{cmd = "set_doc"; doc = @{svg_path = ""; img = @{invert = $false } } } | Out-Null
 }
 
+Test "Фигура начинается в точке нажатия" {
+    Call @{cmd = "set_doc"; doc = @{mode = "Draw"; tool = "Rect"; snap = 0; shapes = @(); show_text = $false; show_drawing = $true } } | Out-Null
+    $a = Call @{cmd = "area_to_screen"; x = 10; y = 10 }; $z = Call @{cmd = "area_to_screen"; x = 90; y = 90 }
+    Call @{cmd = "drag"; from = @{x = $a.x; y = $a.y }; to = @{x = $z.x; y = $z.y }; steps = 8 } | Out-Null
+    $r = (State).doc.shapes[0].Rect
+    Check "прямоугольник от (10,10) до (90,90)" ([math]::Abs($r[0][0] - 10) -lt 0.5 -and [math]::Abs($r[0][1] - 10) -lt 0.5 -and [math]::Abs($r[1][0] - 90) -lt 0.5) "rect=$($r | ConvertTo-Json -Compress)"
+    Call @{cmd = "set_doc"; doc = @{shapes = @(); snap = 1 } } | Out-Null
+}
+
+Test "Картинка: размер, обрезка, ластик, фон" {
+    Add-Type -AssemblyName System.Drawing
+    $img = "$env:TEMP\bambu-plotter-test\t_edit.png"
+    # серый фон, чёрный круг в центре, чёрный квадрат слева
+    $b = New-Object Drawing.Bitmap 400, 300; $g = [Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(200, 200, 200))
+    $g.FillEllipse([Drawing.Brushes]::Black, 150, 100, 100, 100)
+    $g.FillRectangle([Drawing.Brushes]::Black, 20, 120, 60, 60)
+    $b.Save($img, [Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()
+    Call @{cmd = "set_config"; config = @{paper = @{width = 148; height = 210; origin_x = $null; origin_y = $null }; pen = @{offset_x = 0; offset_y = 0 } } } | Out-Null
+    Call @{cmd = "set_doc"; doc = @{show_text = $false; show_table = $false; show_drawing = $false; show_image = $true; svg_fit = $true; svg_pos = $null; svg_rot = 0;
+            img = @{style = "Hatch"; spacing = 1.0; brightness = 0; contrast = 1.0; invert = $false } } } | Out-Null
+    Call @{cmd = "open_file"; path = $img } | Out-Null
+    Call @{cmd = "key"; key = "Escape" } | Out-Null
+    $s = State; $r0 = $s.image_rect; $full = $s.page_stats[0].draw_m
+    Check "картинка на листе" ($null -ne $r0 -and $full -gt 0) "rect=$($r0 -join ',') m=$full"
+
+    # фон: серый фон касается краёв -> убирается, остаются круг и квадрат
+    Call @{cmd = "set_doc"; doc = @{img_bg = $true; img_bg_tol = 0.12 } } | Out-Null
+    $bg = (State).page_stats[0].draw_m
+    Check "«Убрать фон» убирает фон (линий намного меньше)" ($bg -lt $full * 0.6) "было $full м, стало $bg м"
+
+    # ластик: стираем квадрат слева (центр квадрата: 50/400, 150/300 картинки)
+    Call @{cmd = "key"; key = "E" } | Out-Null
+    Check "клавиша E — ластик" ((State).img_tool -eq 2)
+    $w = $r0[2] - $r0[0]; $h = $r0[3] - $r0[1]
+    $a = Call @{cmd = "area_to_screen"; x = ($r0[0] + $w * 0.05); y = ($r0[1] + $h * 0.5) }
+    $z = Call @{cmd = "area_to_screen"; x = ($r0[0] + $w * 0.20); y = ($r0[1] + $h * 0.5) }
+    Call @{cmd = "set_doc"; doc = @{} } | Out-Null
+    $s = State
+    Call @{cmd = "drag"; from = @{x = $a.x; y = $a.y }; to = @{x = $z.x; y = $z.y }; steps = 10 } | Out-Null
+    $s2 = State
+    Check "ластик добавил мазок" ($s2.doc.img_erase.Count -eq 1) "мазков: $($s2.doc.img_erase.Count)"
+    Check "после ластика линий меньше" ($s2.page_stats[0].draw_m -lt $bg) "было $bg, стало $($s2.page_stats[0].draw_m)"
+    Call @{cmd = "key"; key = "Z"; ctrl = $true } | Out-Null
+    Check "Ctrl+Z отменяет мазок ластика" ((State).doc.img_erase.Count -eq 0)
+
+    # обрезка: оставляем правую половину картинки
+    Call @{cmd = "key"; key = "C" } | Out-Null
+    $a = Call @{cmd = "area_to_screen"; x = ($r0[0] + $w * 0.5); y = ($r0[1] + 1) }
+    $z = Call @{cmd = "area_to_screen"; x = ($r0[2] - 1); y = ($r0[3] - 1) }
+    Call @{cmd = "drag"; from = @{x = $a.x; y = $a.y }; to = @{x = $z.x; y = $z.y }; steps = 8 } | Out-Null
+    $c = (State).doc.img_crop
+    Check "обрезка рамкой" ([math]::Abs($c[0] - 0.5) -lt 0.05 -and $c[2] -gt 0.95) "crop=$($c -join ',')"
+    Check "после обрезки инструмент снова «Двигать»" ((State).img_tool -eq 0)
+    Shot "16_cropped"
+    $btn = (Call @{cmd = "widgets" }).widgets | Where-Object label -eq "Сбросить обрезку"
+    if ($btn -and -not $btn.visible) { Call @{cmd = "scroll"; label = "Название задания"; dy = -900 } | Out-Null; Call @{cmd = "wait"; frames = 40 } | Out-Null }
+    $btn = (Call @{cmd = "widgets" }).widgets | Where-Object label -eq "Сбросить обрезку"
+    $cr = Call @{cmd = "click"; label = "Сбросить обрезку" }
+    $cc = (State).doc.img_crop
+    Check "сброс обрезки" ($cc[0] -eq 0 -and $cc[1] -eq 0 -and $cc[2] -eq 1 -and $cc[3] -eq 1) "click=$($cr.ok) $($cr.error) btn visible=$($btn.visible) enabled=$($btn.enabled) y=$($btn.y) crop=$($cc -join ',')"
+
+    # размер: тянем уголок влево-вверх
+    $r = (State).image_rect
+    $hnd = Call @{cmd = "area_to_screen"; x = $r[2]; y = $r[3] }
+    $dst = Call @{cmd = "area_to_screen"; x = ($r[0] + ($r[2] - $r[0]) * 0.5); y = $r[3] }
+    Call @{cmd = "drag"; from = @{x = $hnd.x; y = $hnd.y }; to = @{x = $dst.x; y = $dst.y }; steps = 8 } | Out-Null
+    $r2 = (State).image_rect
+    $nw = $r2[2] - $r2[0]; $ow = $r[2] - $r[0]
+    Check "ручка уменьшает картинку вдвое" ([math]::Abs($nw / $ow - 0.5) -lt 0.05) "ширина $ow -> $nw"
+    Check "пропорции сохранены" ([math]::Abs(($r2[3] - $r2[1]) / $nw - ($r[3] - $r[1]) / $ow) -lt 0.02)
+    Shot "17_resized"
+    Call @{cmd = "set_doc"; doc = @{svg_path = ""; img_bg = $false; img_erase = @(); img_crop = @(0, 0, 1, 1); svg_fit = $true; svg_pos = $null } } | Out-Null
+}
+
 Test "Скрыть настройки" {
     Click "Скрыть настройки"
     Shot "09_no_settings"

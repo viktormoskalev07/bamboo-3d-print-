@@ -1,4 +1,4 @@
-﻿use crate::config::{self, Config, BED_H, BED_W};
+use crate::config::{self, Config, BED_H, BED_W};
 use crate::fonts::{self, FontEntry};
 use crate::geom;
 use crate::jobs::{self, Doc, Mode, Page};
@@ -56,6 +56,8 @@ const HOTKEYS: &[(&str, &str)] = &[
     ("U, R", "Прямоугольник"),
     ("E, O", "Круг"),
     ("G", "Сетка"),
+    ("V / C / E", "Картинка: двигать / обрезать / ластик"),
+    ("[ / ]", "Размер кисти ластика"),
     ("Колесо / правая кнопка", "Масштаб / сдвиг вида"),
     ("F1", "Эта справка"),
 ];
@@ -114,6 +116,15 @@ pub struct App {
     svg: Option<jobs::ImageSrc>,
     svg_loaded: String,
     img_tex: Option<egui::TextureHandle>,
+    /// картинка с учётом ластика и «убрать фон»
+    img_eff: Option<jobs::ImageSrc>,
+    img_eff_key: String,
+    /// инструмент правки картинки: 0 — двигать/размер, 1 — обрезать, 2 — ластик
+    img_tool: u8,
+    erase_mm: f64,
+    erase_live: Vec<(f64, f64)>,
+    crop_drag: Option<((f64, f64), (f64, f64))>,
+    resize_drag: Option<[f64; 4]>,
 
     pages: Vec<Page>,
     page: usize,
@@ -232,6 +243,13 @@ impl App {
             svg: None,
             svg_loaded: String::new(),
             img_tex: None,
+            img_eff: None,
+            img_eff_key: String::new(),
+            img_tool: 0,
+            erase_mm: 4.0,
+            erase_live: Vec::new(),
+            crop_drag: None,
+            resize_drag: None,
             pages: Vec::new(),
             page: 0,
             key: String::new(),
@@ -342,8 +360,27 @@ impl App {
             return;
         }
         self.key = key;
+        // картинка с учётом ластика и «убрать фон» (пересчёт только при изменениях)
+        let eff_key = format!(
+            "{}|{}|{}|{}",
+            self.svg_loaded,
+            serde_json::to_string(&self.doc.img_erase).unwrap_or_default(),
+            self.doc.img_bg,
+            self.doc.img_bg_tol
+        );
+        if eff_key != self.img_eff_key {
+            self.img_eff_key = eff_key;
+            self.img_tex = None;
+            self.img_eff = match &self.svg {
+                Some(jobs::ImageSrc::Raster(r)) if !self.doc.img_erase.is_empty() || self.doc.img_bg => {
+                    Some(jobs::ImageSrc::Raster(r.masked(&self.doc.img_erase, self.doc.img_bg.then_some(self.doc.img_bg_tol))))
+                }
+                _ => None,
+            };
+        }
         if let Some(font) = &self.font {
-            self.pages = jobs::build_pages(&self.doc, &self.cfg, font, self.svg.as_ref());
+            let src = self.img_eff.as_ref().or(self.svg.as_ref());
+            self.pages = jobs::build_pages(&self.doc, &self.cfg, font, src);
         }
         self.page = self.page.min(self.pages.len().saturating_sub(1));
         self.sim = 1.0;
@@ -403,6 +440,8 @@ impl App {
                 self.doc.svg_path = p.display().to_string();
                 self.doc.show_image = true;
                 self.doc.svg_pos = None;
+                self.doc.img_crop = [0.0, 0.0, 1.0, 1.0];
+                self.doc.img_erase.clear();
             }
             "csv" | "tsv" => match table::read_csv(p) {
                 Ok(rows) => {
@@ -457,7 +496,7 @@ impl App {
             self.committed = self.doc.clone();
             self.prev_doc = self.doc.clone();
             self.selected_shape = None;
-            self.notify(ctx, "↶ Отменено", false);
+            self.notify(ctx, "Отменено (Ctrl+Y — повторить)", false);
         } else {
             self.notify(ctx, "Нечего отменять", false);
         }
@@ -469,7 +508,7 @@ impl App {
             self.committed = self.doc.clone();
             self.prev_doc = self.doc.clone();
             self.selected_shape = None;
-            self.notify(ctx, "↷ Повторено", false);
+            self.notify(ctx, "Повторено", false);
         }
     }
 
@@ -509,6 +548,9 @@ impl App {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.selected_shape = None;
             self.selected_elem = None;
+            self.img_tool = 0;
+            self.crop_drag = None;
+            self.erase_live.clear();
             self.draw_pts.clear();
             self.confirm_clear = false;
             self.show_keys = false;
@@ -577,6 +619,24 @@ impl App {
         ] {
             if ctrl(k).is_some() {
                 self.doc.mode = m;
+            }
+        }
+        // инструменты правки картинки
+        if self.doc.mode == Mode::Image {
+            if plain(Key::V).is_some() {
+                self.img_tool = 0;
+            }
+            if plain(Key::C).is_some() {
+                self.img_tool = 1;
+            }
+            if plain(Key::E).is_some() {
+                self.img_tool = 2;
+            }
+            if plain(Key::OpenBracket).is_some() {
+                self.erase_mm = (self.erase_mm / 1.25).max(0.5);
+            }
+            if plain(Key::CloseBracket).is_some() {
+                self.erase_mm = (self.erase_mm * 1.25).min(40.0);
             }
         }
         // инструменты рисования — одной клавишей (как в Photoshop)
@@ -1080,6 +1140,90 @@ impl App {
         self.font_card(ui);
     }
 
+    /// Правка картинки: размер, обрезка, ластик, удаление фона.
+    fn image_edit_card(&mut self, ui: &mut Ui) {
+        let rect = self.pages.first().and_then(|p| p.image_rect);
+        card(ui, "ПРАВКА КАРТИНКИ", |ui| {
+            ui.horizontal(|ui| {
+                for (t, l, tip) in [
+                    (0u8, "Двигать", "Перетаскивать картинку; уголок справа внизу — менять размер (V)"),
+                    (1, "Обрезать", "Обведите рамкой нужную часть картинки на превью (C)"),
+                    (2, "Ластик", "Проведите мышью по картинке — там линий не будет (E)"),
+                ] {
+                    if segment(ui, self.img_tool == t, l).on_hover_text(tip).clicked() {
+                        self.img_tool = t;
+                    }
+                }
+            });
+            match self.img_tool {
+                1 => {
+                    ui.label(RichText::new("Обведите мышью на превью часть картинки, которую оставить.").color(DIM).small());
+                }
+                2 => {
+                    ui.add(egui::Slider::new(&mut self.erase_mm, 0.5..=40.0).text("кисть, мм").logarithmic(true).fixed_decimals(1));
+                    ui.label(RichText::new("Проведите по картинке на превью. [ и ] — размер кисти.").color(DIM).small());
+                }
+                _ => {
+                    if let Some(r) = rect {
+                        let mut w = r[2] - r[0];
+                        let before = w;
+                        row(ui, "Ширина, мм", |ui| ui.add(egui::DragValue::new(&mut w).range(5.0..=400.0).speed(0.5).fixed_decimals(1)));
+                        if (w - before).abs() > 1e-6 {
+                            self.set_image_width(w, r);
+                        }
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                let cropped = self.doc.img_crop != [0.0, 0.0, 1.0, 1.0];
+                let r = ui.add_enabled(cropped, egui::Button::new("Сбросить обрезку").small());
+                auto::track(&r, "Сбросить обрезку", "button");
+                if r.clicked() {
+                    self.commit_history();
+                    self.doc.img_crop = [0.0, 0.0, 1.0, 1.0];
+                }
+                let r = ui.add_enabled(!self.doc.img_erase.is_empty(), egui::Button::new("Сбросить ластик").small());
+                auto::track(&r, "Сбросить ластик", "button");
+                if r.clicked() {
+                    self.commit_history();
+                    self.doc.img_erase.clear();
+                }
+            });
+            ui.add_space(4.0);
+            tcb(ui, &mut self.doc.img_bg, "Убрать фон автоматически");
+            ui.add_enabled(
+                self.doc.img_bg,
+                egui::Slider::new(&mut self.doc.img_bg_tol, 0.02..=0.5).text("допуск фона").fixed_decimals(2),
+            );
+            ui.label(RichText::new("Фон — однотонная область, касающаяся краёв картинки.").color(DIM).small());
+        });
+    }
+
+    /// Новая ширина картинки (мм) с сохранением пропорций.
+    fn set_image_width(&mut self, w: f64, rect: [f64; 4]) {
+        let w = w.max(5.0);
+        self.doc.svg_pos = Some((rect[0], rect[1]));
+        let cur_w = (rect[2] - rect[0]).max(1e-6);
+        match &self.svg {
+            Some(jobs::ImageSrc::Raster(_)) => self.doc.svg_scale = w, // ширина = 100 мм × масштаб/100
+            Some(jobs::ImageSrc::Vector(_)) => {
+                let cur_scale = if self.doc.svg_fit {
+                    // масштаб, при котором текущая ширина получается из исходного размера
+                    let native = match &self.svg {
+                        Some(jobs::ImageSrc::Vector(p)) => geom::bbox(p).map(|b| if self.doc.svg_rot % 2 == 1 { b[3] - b[1] } else { b[2] - b[0] }).unwrap_or(cur_w),
+                        _ => cur_w,
+                    };
+                    cur_w / native.max(1e-6) * 100.0
+                } else {
+                    self.doc.svg_scale
+                };
+                self.doc.svg_scale = (cur_scale * w / cur_w).clamp(1.0, 2000.0);
+            }
+            None => {}
+        }
+        self.doc.svg_fit = false;
+    }
+
     fn image_editor(&mut self, ui: &mut Ui) {
         self.sheet_card(ui, jobs::Elem::Image);
         card(ui, "РИСУНОК: SVG ИЛИ ФОТО", |ui| {
@@ -1095,6 +1239,8 @@ impl App {
                     self.doc.svg_path = p.display().to_string();
                     self.doc.show_image = true;
                     self.doc.svg_pos = None;
+                    self.doc.img_crop = [0.0, 0.0, 1.0, 1.0];
+                    self.doc.img_erase.clear();
                     self.doc.job_name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 }
             }
@@ -1112,10 +1258,14 @@ impl App {
             }
         });
         if let Some(jobs::ImageSrc::Raster(r)) = &self.svg {
-            // превью исходной картинки
+            // превью картинки (с учётом ластика и фона)
             if self.img_tex.is_none() {
-                let (w, h, px) = &r.thumb;
-                let img = egui::ColorImage::from_rgba_unmultiplied([*w, *h], px);
+                let src = match &self.img_eff {
+                    Some(jobs::ImageSrc::Raster(e)) => e,
+                    _ => r,
+                };
+                let (w, h, px) = src.preview_rgba(512);
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
                 self.img_tex = Some(ui.ctx().load_texture("img_thumb", img, egui::TextureOptions::LINEAR));
             }
             let p = &mut self.doc.img;
@@ -1145,6 +1295,7 @@ impl App {
                 tcb(ui, &mut p.invert, "Инвертировать (светлое ↔ тёмное)");
                 ui.label(RichText::new("Меньше шаг — больше деталей, но дольше печать. Ручка обычно 0.4–0.7 мм.").color(DIM).small());
             });
+            self.image_edit_card(ui);
         }
         card(ui, "РАЗМЕЩЕНИЕ", |ui| {
             tcb(ui, &mut self.doc.svg_fit, "Растянуть на весь лист");
@@ -1546,6 +1697,7 @@ impl App {
             let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
             crate::auto::track(&resp, "Превью", "canvas");
             let rect = resp.rect;
+            let press = ui.input(|i| i.pointer.press_origin());
 
             // зум / панорамирование (в режиме рисования левая кнопка рисует, двигаем правой/средней)
             let drawing_mode = self.doc.mode == Mode::Draw;
@@ -1616,7 +1768,7 @@ impl App {
                     self.selected_elem = None;
                 }
                 if resp.drag_started_by(egui::PointerButton::Primary) {
-                    if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(p) = press.or(resp.interact_pointer_pos()) {
                         self.selected_shape = pick(p, &self.doc.shapes, self.font.as_ref());
                         if self.selected_shape.is_some() {
                             self.commit_history();
@@ -1659,7 +1811,7 @@ impl App {
                 let tool = self.doc.tool;
                 let use_snap = tool != crate::jobs::Tool::Pencil;
                 if resp.drag_started_by(egui::PointerButton::Primary) {
-                    if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(p) = press.or(resp.interact_pointer_pos()) {
                         self.draw_pts = vec![screen_to_area(p, use_snap)];
                     }
                 }
@@ -1689,8 +1841,102 @@ impl App {
                 }
             }
 
+            // правка картинки на превью
+            let img_rect = self.pages.first().and_then(|p| p.image_rect).filter(|_| self.page == 0);
+            let is_raster = matches!(self.svg, Some(jobs::ImageSrc::Raster(_)));
+            let image_mode = self.doc.mode == Mode::Image && self.doc.show_image;
+            let mut img_busy = false; // ластик/обрезка/размер перехватили мышь
+            if let (true, Some(ir)) = (image_mode, img_rect) {
+                let crop = self.doc.img_crop;
+                let rot = self.doc.svg_rot;
+                let rect4 = (ir[0], ir[1], ir[2] - ir[0], ir[3] - ir[1]);
+                let to_uv = |a: (f64, f64)| crate::raster::area_to_uv(a.0, a.1, rect4, rot, crop);
+                let handle = area_to_screen((ir[2], ir[3]));
+                let near_handle = |p: Pos2| p.distance(handle) < 12.0;
+                match self.img_tool {
+                    2 if is_raster => {
+                        img_busy = true;
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            self.erase_live.clear();
+                            if let Some(p) = press {
+                                self.erase_live.push(to_uv(screen_to_area(p, false)));
+                            }
+                        }
+                        if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged_by(egui::PointerButton::Primary)) {
+                            let uv = to_uv(screen_to_area(p, false));
+                            if self.erase_live.last().is_none_or(|l| (l.0 - uv.0).hypot(l.1 - uv.1) > 0.002) {
+                                self.erase_live.push(uv);
+                            }
+                        }
+                        if resp.drag_stopped_by(egui::PointerButton::Primary) || (resp.clicked() && self.erase_live.is_empty()) {
+                            if self.erase_live.is_empty() {
+                                if let Some(p) = resp.interact_pointer_pos() {
+                                    self.erase_live.push(to_uv(screen_to_area(p, false)));
+                                }
+                            }
+                            // радиус в долях ширины исходной картинки
+                            let mm_per_u = if rot % 2 == 0 { rect4.2 } else { rect4.3 } / (crop[2] - crop[0]).max(1e-6);
+                            let r = self.erase_mm / 2.0 / mm_per_u.max(1e-6);
+                            self.commit_history();
+                            self.doc.img_erase.push(crate::raster::Erase { r, pts: std::mem::take(&mut self.erase_live) });
+                        }
+                    }
+                    1 if is_raster => {
+                        img_busy = true;
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            if let Some(p) = press.or(resp.interact_pointer_pos()) {
+                                let a = screen_to_area(p, false);
+                                self.crop_drag = Some((a, a));
+                            }
+                        }
+                        if let (Some((a, _)), Some(p)) = (self.crop_drag, resp.interact_pointer_pos()) {
+                            self.crop_drag = Some((a, screen_to_area(p, false)));
+                        }
+                        if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                            if let Some((a, b)) = self.crop_drag.take() {
+                                let (ua, ub) = (to_uv(a), to_uv(b));
+                                let c = [
+                                    ua.0.min(ub.0).clamp(0.0, 1.0),
+                                    ua.1.min(ub.1).clamp(0.0, 1.0),
+                                    ua.0.max(ub.0).clamp(0.0, 1.0),
+                                    ua.1.max(ub.1).clamp(0.0, 1.0),
+                                ];
+                                if c[2] - c[0] > 0.02 && c[3] - c[1] > 0.02 {
+                                    self.commit_history();
+                                    self.doc.img_crop = c;
+                                    self.img_tool = 0;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // ручка размера в правом нижнем углу
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            if let Some(p) = press.or(resp.interact_pointer_pos()).filter(|p| near_handle(*p)) {
+                                let _ = p;
+                                self.commit_history();
+                                self.resize_drag = Some(ir);
+                            }
+                        }
+                        if let Some(start) = self.resize_drag {
+                            img_busy = true;
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let a = screen_to_area(p, false);
+                                let new_w = (a.0 - start[0]).max(5.0);
+                                self.set_image_width(new_w, start);
+                            }
+                            if !resp.dragged() {
+                                self.resize_drag = None;
+                            }
+                        } else if resp.hover_pos().is_some_and(near_handle) {
+                            ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                        }
+                    }
+                }
+            }
+
             // щелчок по элементу листа — выделить его (Delete удалит именно его)
-            if !drawing_mode && self.doc.mode != Mode::Calibrate && resp.clicked() {
+            if !drawing_mode && !img_busy && self.doc.mode != Mode::Calibrate && resp.clicked() {
                 self.selected_elem = None;
                 if let (Some(pp), Some(page)) = (resp.interact_pointer_pos(), self.pages.get(self.page)) {
                     let a = screen_to_area(pp, false);
@@ -1705,8 +1951,8 @@ impl App {
                 }
             }
             // перетаскивание элементов листа (текст, таблица, SVG, рисование)
-            if !drawing_mode && self.doc.mode != Mode::Calibrate && resp.drag_started_by(egui::PointerButton::Primary) {
-                if let (Some(pp), Some(page)) = (resp.interact_pointer_pos(), self.pages.get(self.page)) {
+            if !drawing_mode && !img_busy && self.resize_drag.is_none() && self.doc.mode != Mode::Calibrate && resp.drag_started_by(egui::PointerButton::Primary) {
+                if let (Some(pp), Some(page)) = (press.or(resp.interact_pointer_pos()), self.pages.get(self.page)) {
                     let a = screen_to_area(pp, false);
                     let hit = |b: &[f64; 4]| a.0 >= b[0] - 2.0 && a.0 <= b[2] + 2.0 && a.1 >= b[1] - 2.0 && a.1 <= b[3] + 2.0;
                     let active = jobs::Elem::of_mode(self.doc.mode);
@@ -1759,7 +2005,7 @@ impl App {
                     self.moving = None;
                 }
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else {
+            } else if !img_busy && self.resize_drag.is_none() {
                 self.pan += pan_delta;
             }
 
@@ -1943,6 +2189,63 @@ impl App {
                 };
                 painter.text(paper.center(), Align2::CENTER_CENTER, msg, FontId::proportional(16.0), Color32::from_rgb(160, 165, 175));
             }
+            // подложка: сама картинка под линиями (во вкладке «Рисунок»)
+            if let (true, Some(ir), Some(tex)) = (image_mode, img_rect, self.img_tex.as_ref()) {
+                if is_raster {
+                    let rect4 = (ir[0], ir[1], ir[2] - ir[0], ir[3] - ir[1]);
+                    let (rot, crop) = (self.doc.svg_rot, self.doc.img_crop);
+                    let mut mesh = egui::Mesh::with_texture(tex.id());
+                    let tint = Color32::from_white_alpha(70);
+                    for &(x, y) in &[(ir[0], ir[1]), (ir[2], ir[1]), (ir[2], ir[3]), (ir[0], ir[3])] {
+                        let (u, v) = crate::raster::area_to_uv(x, y, rect4, rot, crop);
+                        mesh.vertices.push(egui::epaint::Vertex { pos: area_to_screen((x, y)), uv: Pos2::new(u as f32, v as f32), color: tint });
+                    }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+                let tl = area_to_screen((ir[0], ir[1]));
+                let br = area_to_screen((ir[2], ir[3]));
+                if self.img_tool == 0 {
+                    // ручка размера
+                    let h = Rect::from_center_size(br, Vec2::splat(12.0));
+                    painter.rect_filled(h, 3.0, ACCENT);
+                    painter.rect_stroke(h, 3.0, Stroke::new(1.5_f32, Color32::WHITE), StrokeKind::Inside);
+                    let _ = tl;
+                }
+                if self.img_tool == 2 && is_raster {
+                    // живой мазок ластика и кисть под курсором
+                    let rect4 = (ir[0], ir[1], ir[2] - ir[0], ir[3] - ir[1]);
+                    let (rot, crop) = (self.doc.svg_rot, self.doc.img_crop);
+                    let rad = (self.erase_mm / 2.0) as f32 * s;
+                    let erase_col = Color32::from_rgba_unmultiplied(255, 120, 120, 90);
+                    // точки мазка — обратно в координаты листа
+                    let uv_to_area = |u: f64, v: f64| -> Pos2 {
+                        let (cu, cv) = ((u - crop[0]) / (crop[2] - crop[0]).max(1e-9), (v - crop[1]) / (crop[3] - crop[1]).max(1e-9));
+                        let (a, b) = match rot % 4 {
+                            1 => (1.0 - cv, cu),
+                            2 => (1.0 - cu, 1.0 - cv),
+                            3 => (cv, 1.0 - cu),
+                            _ => (cu, cv),
+                        };
+                        area_to_screen((rect4.0 + a * rect4.2, rect4.1 + b * rect4.3))
+                    };
+                    for &(u, v) in &self.erase_live {
+                        painter.circle_filled(uv_to_area(u, v), rad, erase_col);
+                    }
+                    if let Some(p) = resp.hover_pos() {
+                        painter.circle_stroke(p, rad, Stroke::new(1.5_f32, Color32::from_rgb(255, 90, 90)));
+                        ctx.set_cursor_icon(egui::CursorIcon::None);
+                    }
+                }
+                if let Some((a, b)) = self.crop_drag {
+                    let r = Rect::from_two_pos(area_to_screen(a), area_to_screen(b));
+                    painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 174, 66, 30));
+                    for seg in dashed_rect(r) {
+                        painter.add(egui::Shape::dashed_line(&seg, Stroke::new(1.5_f32, ACCENT), 6.0, 4.0));
+                    }
+                }
+            }
+
             // рамки элементов листа: активный — зелёный с подписью, под курсором — тонкий
             if self.doc.mode != Mode::Calibrate {
                 if let Some(page) = self.pages.get(self.page) {
@@ -2361,6 +2664,8 @@ impl App {
             "doc": self.doc,
             "config": self.cfg,
             "usable_area": self.cfg.usable_area(),
+            "image_rect": self.pages.first().and_then(|p| p.image_rect),
+            "img_tool": self.img_tool,
             "paper_origin": self.cfg.paper_origin(),
             "prefs": {"show_travel": self.prefs.show_travel, "show_settings": self.prefs.show_settings, "sim_speed": self.prefs.sim_speed, "ink": self.prefs.ink},
         })
