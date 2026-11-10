@@ -371,6 +371,35 @@ Test "Коррекция масштаба" {
     Call @{cmd = "set_config"; config = @{pen = @{scale_x = 1; scale_y = 1 }; paper = @{origin_x = $null; origin_y = $null } } } | Out-Null
 }
 
+Test "Фото → линии" {
+    Add-Type -AssemblyName System.Drawing
+    $img = "$env:TEMP\bambu-plotter-test\t_photo.png"
+    $b = New-Object Drawing.Bitmap 300, 200; $g = [Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::White)
+    $g.FillEllipse([Drawing.Brushes]::Black, 100, 50, 100, 100)
+    $g.FillRectangle([Drawing.Brushes]::Gray, 10, 10, 60, 180)
+    $b.Save($img, [Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()
+    Call @{cmd = "set_config"; config = @{paper = @{width = 148; height = 210; origin_x = $null; origin_y = $null }; pen = @{offset_x = 0; offset_y = 0 } } } | Out-Null
+    Call @{cmd = "set_doc"; doc = @{show_text = $false; show_table = $false; show_drawing = $false; show_image = $true; svg_fit = $true; svg_pos = $null; svg_rot = 0 } } | Out-Null
+    Call @{cmd = "open_file"; path = $img } | Out-Null
+    $res = @{}
+    foreach ($st in "Hatch", "Waves", "Contour") {
+        Call @{cmd = "set_doc"; doc = @{img = @{style = $st; spacing = 1.0; brightness = 0; contrast = 1.2; invert = $false } } } | Out-Null
+        $s = State; $p = $s.page_stats[0]
+        $res[$st] = $p
+        Check "стиль $st даёт линии без ошибок" ($s.mode -eq "Image" -and $p.strokes -gt 0 -and $null -eq $p.error) "strokes=$($p.strokes) err=$($p.error)"
+    }
+    Check "серый прямоугольник: штриховка гуще контура" ($res["Hatch"].draw_m -gt $res["Contour"].draw_m) "hatch=$($res['Hatch'].draw_m) contour=$($res['Contour'].draw_m)"
+    Call @{cmd = "set_doc"; doc = @{img = @{style = "Hatch"; spacing = 2.0 } } } | Out-Null
+    $sparse = (State).page_stats[0].draw_m
+    Check "больше шаг — меньше линий" ($sparse -lt $res["Hatch"].draw_m) "шаг 2: $sparse, шаг 1: $($res['Hatch'].draw_m)"
+    Call @{cmd = "set_doc"; doc = @{img = @{invert = $true; spacing = 1.0 } } } | Out-Null
+    Check "инверсия меняет рисунок" ((State).page_stats[0].draw_m -ne $res["Hatch"].draw_m)
+    $e = Call @{cmd = "export" }
+    Check "фото: экспорт без нагрева и экструзии" ($e.ok -and -not $e.heating -and -not $e.extrusion) "$($e.error)"
+    Shot "15_photo"
+    Call @{cmd = "set_doc"; doc = @{svg_path = ""; img = @{invert = $false } } } | Out-Null
+}
+
 Test "Скрыть настройки" {
     Click "Скрыть настройки"
     Shot "09_no_settings"

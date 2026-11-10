@@ -101,10 +101,12 @@ Call @{cmd = "click"; x = $m.x; y = $m.y } | Out-Null
 Call @{cmd = "key"; key = "Delete" } | Out-Null
 $s = Call @{cmd = "state" }
 Check "с вкладки «Текст»: удалено нарисованное, текст цел" ($s.doc.shapes.Count -eq 0 -and $s.doc.text -eq "Текст остаётся") "shapes=$($s.doc.shapes.Count) text='$($s.doc.text)'"
-# Delete без выделения ничего не трогает
+# Delete без щелчка удаляет то, что обведено зелёной рамкой (активный элемент — текст)
 Call @{cmd = "key"; key = "Escape" } | Out-Null
 Call @{cmd = "key"; key = "Delete" } | Out-Null
-Check "Delete без выделения ничего не удаляет" ((Call @{cmd = "state" }).doc.text -eq "Текст остаётся")
+Check "Delete удаляет обведённое (текст)" ((Call @{cmd = "state" }).doc.text -eq "") "text='$((Call @{cmd = "state" }).doc.text)'"
+Call @{cmd = "key"; key = "Z"; ctrl = $true } | Out-Null
+Check "Ctrl+Z вернул текст" ((Call @{cmd = "state" }).doc.text -eq "Текст остаётся")
 Quit $p
 
 Remove-Item -Recurse -Force $cfgDir, $store -ErrorAction SilentlyContinue

@@ -236,6 +236,14 @@ pub struct Doc {
     pub table_pos: Option<(f64, f64)>,
     /// None — автоматически под текстом и таблицей (или по центру, если «растянуть на лист»)
     pub svg_pos: Option<(f64, f64)>,
+    /// параметры превращения фото/картинки (JPG, PNG…) в линии
+    pub img: crate::raster::Params,
+}
+
+/// Источник «Рисунка»: векторный SVG или растровая картинка.
+pub enum ImageSrc {
+    Vector(Paths),
+    Raster(crate::raster::Raster),
 }
 
 /// Элемент листа (для выделения и перетаскивания мышью).
@@ -298,6 +306,7 @@ impl Default for Doc {
             text_pos: (0.0, 0.0),
             table_pos: None,
             svg_pos: None,
+            img: crate::raster::Params::default(),
         }
     }
 }
@@ -325,7 +334,7 @@ pub fn table_has_content(t: &[Vec<String>]) -> bool {
 
 /// Единый лист: текст + таблица + SVG + рисование одновременно.
 /// Текст и таблица могут продолжаться на следующих страницах; SVG и рисование — на первой.
-pub fn build_pages(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&Paths>) -> Vec<Page> {
+pub fn build_pages(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -> Vec<Page> {
     if doc.mode == Mode::Calibrate {
         let strokes = calibration(doc, cfg, font);
         return finish_pages(vec![(strokes, Vec::new())], cfg);
@@ -352,7 +361,7 @@ pub fn build_pages(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&Paths>) ->
 }
 
 /// Раскладка всех элементов в координатах рабочей области. Возвращает (положения, слои по страницам).
-fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&Paths>) -> Vec<(Elem, Vec<Paths>, bool)> {
+fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -> Vec<(Elem, Vec<Paths>, bool)> {
     // раскладываем только там, куда дотягивается ручка (важно для A4, который больше стола)
     let u = cfg.usable_area();
     let (size, ls) = (cfg.text.size, cfg.text.line_spacing);
@@ -388,12 +397,37 @@ fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&Paths>) -> V
     }
 
     // SVG — по умолчанию под текстом и таблицей, вписан в оставшееся место
-    if let (true, Some(p)) = (doc.show_image, svg) {
+    if let (true, Some(src)) = (doc.show_image, svg) {
         let auto = below(bottom);
-        let mut pos = doc.svg_pos.unwrap_or(auto);
-        let room_auto = room(auto);
-        let placed = place_image(p.clone(), doc, (room_auto.0 + auto.0, room_auto.1 + auto.1), doc.svg_pos.is_none().then_some(auto), &mut pos);
-        layers.push((Elem::Image, vec![placed], false));
+        match src {
+            ImageSrc::Vector(p) => {
+                let mut pos = doc.svg_pos.unwrap_or(auto);
+                let room_auto = room(auto);
+                let placed = place_image(p.clone(), doc, (room_auto.0 + auto.0, room_auto.1 + auto.1), doc.svg_pos.is_none().then_some(auto), &mut pos);
+                layers.push((Elem::Image, vec![placed], false));
+            }
+            ImageSrc::Raster(r) => {
+                // размер: «растянуть» — вписать в свободное место; иначе ширина 100 мм × масштаб
+                let aspect = if doc.svg_rot % 2 == 1 { 1.0 / r.aspect() } else { r.aspect() };
+                let pos = doc.svg_pos.unwrap_or(auto);
+                let (rw, rh) = room(if doc.svg_pos.is_some() { clamp_pos(pos) } else { auto });
+                let (mut w, mut h) = if doc.svg_fit {
+                    if rw / rh > aspect { (rh * aspect, rh) } else { (rw, rw / aspect) }
+                } else {
+                    let w = 100.0 * doc.svg_scale / 100.0;
+                    (w, w / aspect)
+                };
+                if doc.svg_pos.is_none() && (w > rw || h > rh) {
+                    let k = (rw / w).min(rh / h);
+                    w *= k;
+                    h *= k;
+                }
+                let lines = crate::raster::vectorize(r, (pos.0, pos.1, w, h), doc.svg_rot, &doc.img);
+                // штриховка и волны уже идут змейкой — порядок не перемешиваем
+                let ordered = doc.img.style != crate::raster::Style::Contour;
+                layers.push((Elem::Image, vec![lines], ordered));
+            }
+        }
     }
 
     // рисование — в абсолютных мм

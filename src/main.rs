@@ -11,6 +11,7 @@ mod geom;
 mod jobs;
 mod output;
 mod printer;
+mod raster;
 mod svg;
 mod table;
 mod text;

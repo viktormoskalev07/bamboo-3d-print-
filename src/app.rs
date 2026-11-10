@@ -1,6 +1,6 @@
-use crate::config::{self, Config, BED_H, BED_W};
+﻿use crate::config::{self, Config, BED_H, BED_W};
 use crate::fonts::{self, FontEntry};
-use crate::geom::{self, Paths};
+use crate::geom;
 use crate::jobs::{self, Doc, Mode, Page};
 use crate::text::Font;
 use crate::{connect, printer, svg, table};
@@ -111,8 +111,9 @@ pub struct App {
     font_filter: String,
     all_fonts: bool,
 
-    svg: Option<Paths>,
+    svg: Option<jobs::ImageSrc>,
     svg_loaded: String,
+    img_tex: Option<egui::TextureHandle>,
 
     pages: Vec<Page>,
     page: usize,
@@ -230,6 +231,7 @@ impl App {
             all_fonts,
             svg: None,
             svg_loaded: String::new(),
+            img_tex: None,
             pages: Vec::new(),
             page: 0,
             key: String::new(),
@@ -313,7 +315,14 @@ impl App {
         if self.doc.svg_path.is_empty() {
             return;
         }
-        match svg::load(Path::new(&self.doc.svg_path)) {
+        self.img_tex = None;
+        let path = Path::new(&self.doc.svg_path);
+        let loaded = if crate::raster::is_raster(path) {
+            crate::raster::load(path).map(jobs::ImageSrc::Raster)
+        } else {
+            svg::load(path).map(jobs::ImageSrc::Vector)
+        };
+        match loaded {
             Ok(p) => self.svg = Some(p),
             Err(e) => self.build_error = Some(format!("SVG: {e:#}")),
         }
@@ -376,7 +385,7 @@ impl App {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Текст, таблицы, рисунки", &["txt", "md", "csv", "tsv", "svg"])
+            .add_filter("Текст, таблицы, рисунки, фото", &["txt", "md", "csv", "tsv", "svg", "png", "jpg", "jpeg", "bmp", "gif", "webp"])
             .add_filter("Все файлы", &["*"])
             .pick_file()
         {
@@ -389,7 +398,7 @@ impl App {
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         match ext.as_str() {
-            "svg" => {
+            "svg" | "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" => {
                 self.doc.mode = Mode::Image;
                 self.doc.svg_path = p.display().to_string();
                 self.doc.show_image = true;
@@ -630,7 +639,12 @@ impl App {
                 return;
             }
         }
-        match self.selected_elem.take() {
+        let outlined = || -> Option<jobs::Elem> {
+            let active = self.moving.as_ref().map(|m| m.elem).or(jobs::Elem::of_mode(self.doc.mode))?;
+            self.pages.get(self.page)?.boxes.iter().any(|(e, _)| *e == active).then_some(active)
+        };
+        let target = self.selected_elem.take().or_else(outlined);
+        match target {
             Some(jobs::Elem::Text) => {
                 self.doc.text.clear();
                 self.notify(ctx, "Текст удалён (Ctrl+Z — вернуть)", false);
@@ -819,7 +833,7 @@ impl App {
                         {
                             self.save_dialog(ctx);
                         }
-                        if tg(ui, "📂  Открыть").on_hover_text("Открыть .txt / .csv / .svg").clicked() {
+                        if tg(ui, "📂  Открыть").on_hover_text("Открыть текст, таблицу, SVG или фото (JPG, PNG…)").clicked() {
                             self.open_dialog(ctx);
                         }
                         let r = ui.add(ghost_button("🗑  Очистить"));
@@ -1067,13 +1081,16 @@ impl App {
 
     fn image_editor(&mut self, ui: &mut Ui) {
         self.sheet_card(ui, jobs::Elem::Image);
-        card(ui, "РИСУНОК (SVG)", |ui| {
+        card(ui, "РИСУНОК: SVG ИЛИ ФОТО", |ui| {
             let r = ui.add(
-                egui::Button::new(RichText::new("📂  Выбрать SVG-файл…").size(15.0)).min_size(Vec2::new(ui.available_width(), 38.0)),
+                egui::Button::new(RichText::new("📂  Выбрать файл (SVG, JPG, PNG…)").size(15.0)).min_size(Vec2::new(ui.available_width(), 38.0)),
             );
             crate::auto::track(&r, "Выбрать SVG-файл", "button");
             if r.clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Рисунки и фото", &["svg", "png", "jpg", "jpeg", "bmp", "gif", "webp"])
+                    .pick_file()
+                {
                     self.doc.svg_path = p.display().to_string();
                     self.doc.show_image = true;
                     self.doc.svg_pos = None;
@@ -1081,7 +1098,7 @@ impl App {
                 }
             }
             if self.doc.svg_path.is_empty() {
-                ui.label(RichText::new("Файл не выбран. Подойдут SVG из Inkscape, Illustrator, Figma.").color(DIM));
+                ui.label(RichText::new("Файл не выбран. SVG рисуется как есть; фото и картинки (JPG, PNG, BMP, GIF, WebP) превращаются в линии.").color(DIM));
             } else {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(file_name(Path::new(&self.doc.svg_path))).strong());
@@ -1093,6 +1110,41 @@ impl App {
                 });
             }
         });
+        if let Some(jobs::ImageSrc::Raster(r)) = &self.svg {
+            // превью исходной картинки
+            if self.img_tex.is_none() {
+                let (w, h, px) = &r.thumb;
+                let img = egui::ColorImage::from_rgba_unmultiplied([*w, *h], px);
+                self.img_tex = Some(ui.ctx().load_texture("img_thumb", img, egui::TextureOptions::LINEAR));
+            }
+            let p = &mut self.doc.img;
+            let tex = self.img_tex.clone();
+            card(ui, "ФОТО → ЛИНИИ", |ui| {
+                if let Some(t) = &tex {
+                    let sz = t.size_vec2();
+                    let k = (ui.available_width() / sz.x).min(160.0 / sz.y).min(1.0);
+                    ui.image((t.id(), sz * k));
+                }
+                ui.label(RichText::new("Стиль").color(DIM).small());
+                ui.horizontal(|ui| {
+                    use crate::raster::Style;
+                    for (st, l, tip) in [
+                        (Style::Hatch, "Штриховка", "Слои штрихов: чем темнее, тем гуще. Для фото."),
+                        (Style::Waves, "Волны", "Строки-синусоиды, почти одной линией. Для портретов."),
+                        (Style::Contour, "Контур", "Обводка границ. Для логотипов, рисунков, надписей."),
+                    ] {
+                        if segment(ui, p.style == st, l).on_hover_text(tip).clicked() {
+                            p.style = st;
+                        }
+                    }
+                });
+                ui.add(egui::Slider::new(&mut p.spacing, 0.3..=4.0).text("шаг линий, мм").fixed_decimals(1));
+                ui.add(egui::Slider::new(&mut p.brightness, -1.0..=1.0).text("яркость").fixed_decimals(2));
+                ui.add(egui::Slider::new(&mut p.contrast, 0.3..=3.0).text("контраст").fixed_decimals(2));
+                tcb(ui, &mut p.invert, "Инвертировать (светлое ↔ тёмное)");
+                ui.label(RichText::new("Меньше шаг — больше деталей, но дольше печать. Ручка обычно 0.4–0.7 мм.").color(DIM).small());
+            });
+        }
         card(ui, "РАЗМЕЩЕНИЕ", |ui| {
             tcb(ui, &mut self.doc.svg_fit, "Растянуть на весь лист");
             ui.add_enabled(
@@ -1912,9 +1964,9 @@ impl App {
                                 painter.add(egui::Shape::dashed_line(&seg, Stroke::new(1.5_f32, ACCENT), 6.0, 4.0));
                             }
                             let hint = if *elem == jobs::Elem::Drawing && drawing_mode {
-                                elem.name().to_string()
+                                format!("{} · Delete — удалить всё нарисованное", elem.name())
                             } else {
-                                format!("{} — перетащите, чтобы сдвинуть", elem.name())
+                                format!("{} · перетащите, чтобы сдвинуть · Delete — удалить", elem.name())
                             };
                             let g = painter.layout_no_wrap(hint, FontId::proportional(12.0), Color32::WHITE);
                             let lr = Rect::from_min_size(r.left_top() - Vec2::new(0.0, g.size().y + 8.0), g.size() + Vec2::new(10.0, 6.0));
