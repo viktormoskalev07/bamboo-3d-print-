@@ -196,7 +196,7 @@ pub fn area_to_uv(x: f64, y: f64, rect: (f64, f64, f64, f64), rot: u8, crop: [f6
     (crop[0] + u * (crop[2] - crop[0]), crop[1] + v * (crop[3] - crop[1]))
 }
 
-pub fn vectorize(r: &Raster, rect: (f64, f64, f64, f64), rot: u8, crop: [f64; 4], p: &Params) -> Paths {
+pub fn vectorize(r: &Raster, rect: (f64, f64, f64, f64), rot: u8, crop: [f64; 4], p: &Params, tip: f64) -> Paths {
     let uv = |x: f64, y: f64| area_to_uv(x, y, rect, rot, crop);
     let dark = |x: f64, y: f64| {
         let (u, v) = uv(x, y);
@@ -204,17 +204,35 @@ pub fn vectorize(r: &Raster, rect: (f64, f64, f64, f64), rot: u8, crop: [f64; 4]
     };
     let spacing = p.spacing.clamp(0.2, 10.0);
     match p.style {
-        Style::Hatch => hatch(rect, spacing, &dark),
+        Style::Hatch => hatch(rect, spacing, tip, &dark),
         Style::Waves => waves(rect, spacing, &dark),
         Style::Contour => contour(rect, spacing, &dark),
     }
 }
 
+/// Пороги слоёв штриховки с учётом толщины ручки.
+/// Один слой закрывает долю c = толщина/шаг бумаги; k слоёв — 1-(1-c)^k.
+/// Слой k рисуем там, где темнота больше середины между покрытием (k-1) и k слоёв —
+/// так плотность на бумаге следует за яркостью фото, а не заливает всё сплошь.
+pub fn hatch_thresholds(spacing: f64, tip: f64) -> Vec<f64> {
+    let c = (tip / spacing.max(1e-6)).clamp(0.05, 1.0);
+    let mut cov = 0.0f64;
+    (0..4)
+        .map(|_| {
+            let next = 1.0 - (1.0 - cov) * (1.0 - c);
+            let t = cov + (next - cov) * 0.5;
+            cov = next;
+            t.min(0.97)
+        })
+        .collect()
+}
+
 /// Штриховка: слои под 0°, 90°, 45°, 135°; каждый следующий — только в более тёмных местах.
-fn hatch(rect: (f64, f64, f64, f64), spacing: f64, dark: &dyn Fn(f64, f64) -> f64) -> Paths {
+fn hatch(rect: (f64, f64, f64, f64), spacing: f64, tip: f64, dark: &dyn Fn(f64, f64) -> f64) -> Paths {
     let (rx, ry, rw, rh) = rect;
     let mut out = Paths::new();
-    let layers = [(0.0f64, 0.12), (90.0, 0.35), (45.0, 0.58), (135.0, 0.8)];
+    let th = hatch_thresholds(spacing, tip);
+    let layers = [(0.0f64, th[0]), (90.0, th[1]), (45.0, th[2]), (135.0, th[3])];
     let step = (spacing * 0.35).clamp(0.15, 0.6);
     let (cx, cy) = (rx + rw / 2.0, ry + rh / 2.0);
     let half_diag = (rw * rw + rh * rh).sqrt() / 2.0;

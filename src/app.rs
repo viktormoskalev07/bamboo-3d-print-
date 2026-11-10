@@ -813,10 +813,19 @@ impl App {
         let dir = std::env::temp_dir().join("bambu-plotter");
         let _ = std::fs::create_dir_all(&dir);
         let title = self.job_title();
-        let ascii = translit(&title);
-        let path = dir.join(format!("{ascii}.gcode.3mf"));
-        if let Err(e) = self.export_to(&path) {
+        let ascii0 = translit(&title);
+        let tmp = dir.join(format!("{ascii0}.tmp.gcode.3mf"));
+        if let Err(e) = self.export_to(&tmp) {
             self.notify(ctx, format!("{e:#}"), true);
+            return;
+        }
+        // уникальное имя по содержимому: иначе Connect/принтер могут взять старый файл с тем же именем
+        let hash = std::fs::read(&tmp).map(|b| format!("{:x}", md5::compute(b))).unwrap_or_default();
+        let ascii = format!("{ascii0}_{}", &hash[..6.min(hash.len())]);
+        let path = dir.join(format!("{ascii}.gcode.3mf"));
+        let _ = std::fs::remove_file(&path);
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            self.notify(ctx, format!("Не удалось сохранить задание: {e}"), true);
             return;
         }
         if self.cfg.printer.method == "lan" {
@@ -1290,11 +1299,32 @@ impl App {
                         }
                     }
                 });
-                ui.add(egui::Slider::new(&mut p.spacing, 0.3..=4.0).text("шаг линий, мм").fixed_decimals(1));
+                ui.add(egui::Slider::new(&mut p.spacing, 0.3..=6.0).text("шаг линий, мм").fixed_decimals(1));
+                let tip = self.cfg.pen.tip_mm;
+                ui.horizontal(|ui| {
+                    let ratio = p.spacing / tip.max(0.01);
+                    let (txt, col) = if p.style == crate::raster::Style::Contour {
+                        (String::new(), DIM)
+                    } else if ratio < 1.6 {
+                        (format!("Шаг ≈ толщине ручки ({tip:.2} мм): линии сольются в заливку"), DANGER)
+                    } else if ratio < 2.5 {
+                        ("Мало полутонов — увеличьте шаг".to_string(), Color32::from_rgb(240, 180, 60))
+                    } else {
+                        ("Полутона будут видны".to_string(), ACCENT)
+                    };
+                    if !txt.is_empty() {
+                        ui.label(RichText::new(txt).color(col).small());
+                    }
+                });
+                let r = ui.button("Подобрать шаг под ручку").on_hover_text("Шаг = 3 × толщина линии ручки — минимум для полутонов");
+                auto::track(&r, "Подобрать шаг под ручку", "button");
+                if r.clicked() {
+                    p.spacing = (tip * 3.0).clamp(0.3, 6.0);
+                }
                 ui.add(egui::Slider::new(&mut p.brightness, -1.0..=1.0).text("яркость").fixed_decimals(2));
                 ui.add(egui::Slider::new(&mut p.contrast, 0.3..=3.0).text("контраст").fixed_decimals(2));
                 tcb(ui, &mut p.invert, "Инвертировать (светлое ↔ тёмное)");
-                ui.label(RichText::new("Меньше шаг — больше деталей, но дольше печать. Ручка обычно 0.4–0.7 мм.").color(DIM).small());
+                ui.label(RichText::new("Толщина линии ручки задаётся в настройках ручки — превью рисует линии именно такой толщины.").color(DIM).small());
             });
         } else if matches!(self.svg, Some(jobs::ImageSrc::Vector(_))) {
             card(ui, "ПРАВКА КАРТИНКИ", |ui| {
@@ -1568,6 +1598,9 @@ impl App {
             });
             row(ui, "Y (+ назад)", |ui| {
                 ui.add(egui::DragValue::new(&mut pen.offset_y).range(-100.0..=100.0).speed(0.1).fixed_decimals(1).suffix(" мм"))
+            });
+            row(ui, "Толщина линии ручки", |ui| {
+                ui.add(egui::DragValue::new(&mut pen.tip_mm).range(0.1..=3.0).speed(0.02).fixed_decimals(2).suffix(" мм"))
             });
             row(ui, "Пауза после касания", |ui| {
                 ui.add(egui::DragValue::new(&mut pen.pen_down_delay_ms).range(0..=2000).speed(5.0).suffix(" мс"))
@@ -2139,7 +2172,8 @@ impl App {
 
             // штрихи
             let ink = Color32::from_rgb(self.prefs.ink[0], self.prefs.ink[1], self.prefs.ink[2]);
-            let width = (0.3 * s).clamp(0.8, 5.0);
+            // настоящая толщина линии ручки — превью показывает, сольются ли штрихи
+            let width = (self.cfg.pen.tip_mm as f32 * s).max(1.0);
             let mut head: Option<Pos2> = None;
             if let Some(page) = self.pages.get(self.page) {
                 // рисуем ровно то, что сделает G-code: линии там, где ручка по Z на бумаге
@@ -2227,7 +2261,17 @@ impl App {
 
             // подложка: сама картинка под линиями (во вкладке «Рисунок»)
             if let (true, Some(ir), Some(tex)) = (image_mode, img_rect, self.img_tex.as_ref()) {
-                if is_raster {
+                // исходное фото показываем ТОЛЬКО в режимах «Ластик» и «Обрезать»: в обычном виде превью
+                // показывает лишь то, что реально нарисует ручка
+                if is_raster && self.img_tool != 0 {
+                    let tl = area_to_screen((ir[0], ir[1]));
+                    painter.text(
+                        tl - Vec2::new(0.0, 6.0),
+                        Align2::LEFT_BOTTOM,
+                        "исходное фото — только для правки, печататься не будет",
+                        FontId::proportional(12.0),
+                        Color32::from_rgb(200, 90, 90),
+                    );
                     let rect4 = (ir[0], ir[1], ir[2] - ir[0], ir[3] - ir[1]);
                     let (rot, crop) = (self.doc.svg_rot, self.doc.img_crop);
                     let mut mesh = egui::Mesh::with_texture(tex.id());

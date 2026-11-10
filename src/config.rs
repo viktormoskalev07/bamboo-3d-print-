@@ -50,6 +50,8 @@ pub struct PenCfg {
     /// коррекция масштаба по X / Y (1.0 = без коррекции); подбирается по тесту 100×100 мм
     pub scale_x: f64,
     pub scale_y: f64,
+    /// толщина линии, которую оставляет ручка, мм (для честного превью и штриховки фото)
+    pub tip_mm: f64,
     pub park_x: f64,
     pub park_y: f64,
 }
@@ -70,6 +72,7 @@ impl Default for PenCfg {
             invert_y: false,
             scale_x: 1.0,
             scale_y: 1.0,
+            tip_mm: 0.5,
             park_x: 0.0,
             park_y: 250.0,
         }

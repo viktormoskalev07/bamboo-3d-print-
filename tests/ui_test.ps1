@@ -394,6 +394,19 @@ Test "Фото → линии" {
     Check "больше шаг — меньше линий" ($sparse -lt $res["Hatch"].draw_m) "шаг 2: $sparse, шаг 1: $($res['Hatch'].draw_m)"
     Call @{cmd = "set_doc"; doc = @{img = @{invert = $true; spacing = 1.0 } } } | Out-Null
     Check "инверсия меняет рисунок" ((State).page_stats[0].draw_m -ne $res["Hatch"].draw_m)
+    # толщина ручки: при шаге ≈ толщине штриховка не должна заливать светлые места
+    Call @{cmd = "set_doc"; doc = @{img = @{style = "Hatch"; spacing = 0.8; invert = $false; brightness = 0; contrast = 1.2 } } } | Out-Null
+    Call @{cmd = "set_config"; config = @{pen = @{tip_mm = 0.2 } } } | Out-Null
+    $thin = (State).page_stats[0].draw_m
+    Call @{cmd = "set_config"; config = @{pen = @{tip_mm = 0.8 } } } | Out-Null
+    $thick = (State).page_stats[0].draw_m
+    Check "толстая ручка — меньше слоёв штриховки (нет сплошной заливки)" ($thick -lt $thin * 0.8) "ручка 0.2 мм: $thin м, ручка 0.8 мм: $thick м"
+    $btn = (Call @{cmd = "widgets" }).widgets | Where-Object label -eq "Подобрать шаг под ручку"
+    if ($btn -and -not $btn.visible) { Call @{cmd = "scroll"; label = "Название задания"; dy = -1500 } | Out-Null; Call @{cmd = "wait"; frames = 40 } | Out-Null }
+    $r = Call @{cmd = "click"; label = "Подобрать шаг под ручку" }
+    Check "«Подобрать шаг» = 3 × толщина ручки" ([math]::Abs((State).doc.img.spacing - 2.4) -lt 0.01) "click=$($r.ok) $($r.error) spacing=$((State).doc.img.spacing)"
+    Call @{cmd = "set_config"; config = @{pen = @{tip_mm = 0.5 } } } | Out-Null
+
     $e = Call @{cmd = "export" }
     Check "фото: экспорт без нагрева и экструзии" ($e.ok -and -not $e.heating -and -not $e.extrusion) "$($e.error)"
     Shot "15_photo"
@@ -413,7 +426,7 @@ Test "Картинка: размер, обрезка, ластик, фон" {
     Add-Type -AssemblyName System.Drawing
     $img = "$env:TEMP\bambu-plotter-test\t_edit.png"
     # серый фон, чёрный круг в центре, чёрный квадрат слева
-    $b = New-Object Drawing.Bitmap 400, 300; $g = [Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(200, 200, 200))
+    $b = New-Object Drawing.Bitmap 400, 300; $g = [Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(120, 120, 120))
     $g.FillEllipse([Drawing.Brushes]::Black, 150, 100, 100, 100)
     $g.FillRectangle([Drawing.Brushes]::Black, 20, 120, 60, 60)
     $b.Save($img, [Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()

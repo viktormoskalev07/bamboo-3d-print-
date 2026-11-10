@@ -442,7 +442,7 @@ fn layout_layers(doc: &Doc, cfg: &Config, font: &Font, svg: Option<&ImageSrc>) -
                     w *= k;
                     h *= k;
                 }
-                let lines = crate::raster::vectorize(r, (pos.0, pos.1, w, h), doc.svg_rot, doc.img_crop, &doc.img);
+                let lines = crate::raster::vectorize(r, (pos.0, pos.1, w, h), doc.svg_rot, doc.img_crop, &doc.img, cfg.pen.tip_mm);
                 image_rect = Some([pos.0, pos.1, pos.0 + w, pos.1 + h]);
                 // штриховка и волны уже идут змейкой — порядок не перемешиваем
                 let ordered = doc.img.style != crate::raster::Style::Contour;
